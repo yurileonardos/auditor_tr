@@ -2,5 +2,6 @@ streamlit
 pandas
 pdfplumber
 requests
-beautifulsoup4
 openpyxl
+lxml
+beautifulsoup4
