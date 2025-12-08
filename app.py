@@ -1,41 +1,44 @@
-# app.py (versão revisada)
+# app.py - Extrator flexível + Consulta CATMAT/CATSER + HTML por grupo
 import streamlit as st
 import pandas as pd
 import pdfplumber
 import re
 import requests
 from io import BytesIO
+from datetime import datetime
 
-st.set_page_config(page_title="Auditor TR - Validação Completa (Revisado)", layout="wide")
-st.title("🛡️ Auditor TR — Extração robusta + Consulta CATMAT")
+st.set_page_config(page_title="Auditor TR - Extração Flexível + CATMAT", layout="wide")
+st.title("🛡️ Auditor TR — Extração Flexível (colunas variáveis) + Consulta CATMAT")
 
 # -------------------------
-# UTILIDADES
+# Utilitários
 # -------------------------
 def clean_number(value):
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    if value is None:
         return 0.0
-    text = str(value).upper().replace('R$', '').replace(' ', '').strip()
-    text = text.replace('.', '').replace(',', '.')
-    clean_str = re.sub(r'[^\d\.]', '', text)
+    s = str(value)
+    s = s.replace('R$', '').replace('\xa0', ' ').strip()
+    s = s.replace('.', '').replace(',', '.')
+    s = re.sub(r'[^\d\.-]', '', s)
     try:
-        return float(clean_str) if clean_str != "" else 0.0
+        return float(s) if s != '' else 0.0
     except:
         return 0.0
 
-def normalize_text(text):
-    return str(text).strip() if text else ""
+def normalize_text(t):
+    if t is None:
+        return ""
+    return str(t).strip()
 
 # -------------------------
-# CONSULTA API GOV (CATMAT / CATSER)
+# Consulta GOV (API oficial)
 # -------------------------
 @st.cache_data(show_spinner=False)
 def consultar_item_governo(codigo):
-    codigo = re.sub(r'\D', '', str(codigo))
+    codigo = re.sub(r'\D','', str(codigo))
     if not codigo:
-        return {"status_api": "Inválido", "descricao":"", "unidade": "-", "link": ""}
-
-    # Primeiro: tentar materiais
+        return {"status_api":"Inválido","descricao":"","unidade":"-","link":""}
+    # Tenta materiais
     try:
         url = f"https://compras.dados.gov.br/materiais/v1/materiais.json?codigo={codigo}"
         r = requests.get(url, timeout=5)
@@ -45,17 +48,10 @@ def consultar_item_governo(codigo):
             if lista:
                 item = lista[0]
                 unidade = item.get("unidade_medida") or item.get("unidade") or "-"
-                return {
-                    "status_api": "Ativo-Material",
-                    "descricao": item.get("descricao",""),
-                    "unidade": unidade,
-                    "link": f"https://catalogo.compras.gov.br/cnbs-web/busca?cod={codigo}"
-                }
-    except Exception as e:
-        # não interrompe; vamos tentar serviço
+                return {"status_api":"Ativo-Material", "descricao": item.get("descricao",""), "unidade": unidade, "link": f"https://catalogo.compras.gov.br/cnbs-web/busca?cod={codigo}"}
+    except:
         pass
-
-    # Segundo: tentar serviços
+    # Tenta serviços
     try:
         url = f"https://compras.dados.gov.br/servicos/v1/servicos.json?codigo={codigo}"
         r = requests.get(url, timeout=5)
@@ -64,282 +60,276 @@ def consultar_item_governo(codigo):
             lista = j.get("_embedded", {}).get("servicos", [])
             if lista:
                 item = lista[0]
-                return {
-                    "status_api": "Ativo-Servico",
-                    "descricao": item.get("descricao",""),
-                    "unidade": item.get("unidade") or "UN",
-                    "link": f"https://catalogo.compras.gov.br/cnbs-web/busca?cod={codigo}"
-                }
+                unidade = item.get("unidade") or "UN"
+                return {"status_api":"Ativo-Servico", "descricao": item.get("descricao",""), "unidade": unidade, "link": f"https://catalogo.compras.gov.br/cnbs-web/busca?cod={codigo}"}
     except:
         pass
-
     return {"status_api":"Não Encontrado", "descricao":"", "unidade":"-", "link": f"https://catalogo.compras.gov.br/cnbs-web/busca?cod={codigo}"}
 
 # -------------------------
-# EXTRAÇÃO HÍBRIDA (tabelas + texto) COM DETECÇÃO DE GRUPOS E ITENS
+# Heurísticas para identificar cabeçalho de tabela
 # -------------------------
-def extract_structured_from_pdf(file_stream):
+HEADER_KEYWORDS = [
+    "item","descr","descricao","unidade","catmat","catser","qtd","quant","quantidade",
+    "preco","preço","unit","unitario","total","são paulo","são","sp","rio","recife","manaus","caeté","caete"
+]
+
+def guess_header_index(rows):
     """
-    Vai tentar extrair:
-    - reconhecer linhas de tabela via pdfplumber.extract_tables
-    - quando falhar, faz varredura no texto para identificar blocos 'GRUPO' e linhas de item
-    - retorna DataFrame com colunas: Grupo, Item, Código, Descrição, Unidade, Qtd, VUnit, VTotal
+    Recebe lista de linhas (listas de células). Retorna índice da linha que parece ser cabeçalho.
     """
+    for i, row in enumerate(rows[:30]):
+        if not any(cell for cell in row):
+            continue
+        row_text = " ".join([str(x).lower() for x in row if x])
+        score = sum(1 for kw in HEADER_KEYWORDS if kw in row_text)
+        # heurística: se encontrou 2+ palavras-chave, provável header
+        if score >= 2:
+            return i
+    return None
+
+# -------------------------
+# Extração híbrida e flexível
+# -------------------------
+def extract_tables_and_lines(file_stream):
     pages_text = []
-    all_tabular_rows = []
+    tabular_rows = []  # lista de linhas (cada linha = lista de células)
     with pdfplumber.open(file_stream) as pdf:
         for page in pdf.pages:
-            text = page.extract_text() or ""
-            pages_text.append(text)
-            # tenta extrair tabelas (com estratégia por linhas)
+            txt = page.extract_text() or ""
+            pages_text.append(txt)
+            # tenta extrair tabelas (mais tolerante)
             try:
                 tables = page.extract_tables(table_settings={"vertical_strategy":"lines", "horizontal_strategy":"lines"})
+                if not tables:
+                    tables = page.extract_tables()
             except Exception:
                 tables = page.extract_tables()
             if tables:
                 for t in tables:
                     for r in t:
-                        # converte None -> ""
-                        row = ["" if c is None else c for c in r]
+                        # normalize None->""
+                        row = [("" if c is None else c) for c in r]
                         if any(str(x).strip() for x in row):
-                            all_tabular_rows.append(row)
-
+                            tabular_rows.append(row)
     full_text = "\n".join(pages_text)
+    return tabular_rows, full_text
 
-    # 1) Se extração tabular trouxe linhas com muitos campos (é uma boa), tenta mapear por cabeçalho
-    df_from_table = None
-    if all_tabular_rows:
-        # busca linha de cabeçalho - heurística
-        header_idx = None
-        for i, row in enumerate(all_tabular_rows[:20]):
-            row_lower = " ".join([str(x).lower() for x in row])
-            if ("descri" in row_lower and ("qtd" in row_lower or "quant" in row_lower)) or ("catmat" in row_lower or "catser" in row_lower):
-                header_idx = i
-                break
+def rebuild_structured_df(tabular_rows, full_text):
+    """
+    1) Se houver tabular_rows, tenta identificar o cabeçalho e construir DF mantendo ordem original de colunas.
+    2) Se falhar ou parcial, faz fallback para análise textual por linhas (regex) para detectar códigos e grupos.
+    """
+    if tabular_rows:
+        # Tenta identificar header
+        header_idx = guess_header_index(tabular_rows)
+        if header_idx is None:
+            # fallback: assume primeira linha não vazia é header
+            for i, r in enumerate(tabular_rows[:5]):
+                if any(str(x).strip() for x in r):
+                    header_idx = i
+                    break
 
-        if header_idx is not None:
-            headers = [str(x).strip() or f"col{i}" for i, x in enumerate(all_tabular_rows[header_idx])]
-            data_rows = all_tabular_rows[header_idx+1:]
-            df_from_table = pd.DataFrame(data_rows, columns=headers[:len(data_rows[0])])
-            # Normalize column names to easier keys
-            # We'll still fallback to text parsing later if needed
+        # se header encontrado, monta DF
+        if header_idx is not None and header_idx < len(tabular_rows)-1:
+            headers_raw = [normalize_text(c) for c in tabular_rows[header_idx]]
+            # Normalize headers to safe unique column names while preserving original string
+            headers = []
+            header_map = {}  # map normalized->original
+            for i, h in enumerate(headers_raw):
+                hstr = h if h else f"col{i}"
+                # preserve original content for HTML later
+                headers.append(hstr)
+                header_map[hstr] = hstr
 
-    # 2) Texto profundo: detectar blocos GRUPO e linhas de itens por padrão (mais robusto)
-    # Padrões:
-    # - "GRUPO n - ..." -> define group
-    # - item lines: começam com número do item (1/2 dígitos) possivelmente seguido de descrição, e no final possuem CATMAT (códigos numericos 5-7 dígitos) e preço unitário e total
-    groups = []
-    rows_struct = []
+            data_rows = tabular_rows[header_idx+1:]
+            # ensure uniform length: pad rows to header length
+            processed = []
+            for r in data_rows:
+                row = [("" if c is None else c) for c in r]
+                if len(row) < len(headers):
+                    row += [""]*(len(headers)-len(row))
+                processed.append(row[:len(headers)])
+            try:
+                df = pd.DataFrame(processed, columns=headers)
+                # Basic cleaning: strip strings
+                df = df.applymap(lambda x: normalize_text(x) if isinstance(x, str) else x)
+                return df, header_idx
+            except Exception:
+                pass
 
+    # Fallback textual parsing: busca sequências de itens por pagina/linha
+    # Identifica grupos e cria colunas padrão quando possível
+    pattern_group = re.compile(r"\bGRUPO\s*\d+", flags=re.IGNORECASE)
+    pattern_cat = re.compile(r"\b\d{5,7}\b")
+    lines = full_text.splitlines()
     current_group = "Sem Grupo Identificado"
-
-    # quebrar texto por linhas e analisar
-    text_lines = []
-    for p_text in pages_text:
-        for ln in p_text.splitlines():
-            ln_stripped = ln.strip()
-            if ln_stripped:
-                text_lines.append(ln_stripped)
-
-    # detecta grupos e itens
-    # regex para detectar "GRUPO" ou "GRUPO X -"
-    re_group = re.compile(r"\bGRUPO\s*\d+", flags=re.IGNORECASE)
-    # regex para detectar linha com código CATMAT (5-7 dígitos) e preços (valor com vírgula ou ponto)
-    re_catmat = re.compile(r"(\d{5,7})")
-    # regex para preços (ex: 1.234,56 ou 1234.56)
-    re_price = re.compile(r"(\d{1,3}(?:[\.\,]\d{3})*[\.,]\d{2})")
-
-    # Vamos percorrer as linhas, agregando quando necessário
-    i = 0
-    while i < len(text_lines):
-        ln = text_lines[i]
-
-        # atualiza grupo
-        if re_group.search(ln):
-            current_group = ln.strip()
-            i += 1
+    rows = []
+    for i, line in enumerate(lines):
+        ln = line.strip()
+        if not ln:
             continue
-
-        # tenta achar código CATMAT na linha
-        cat_match = re_catmat.search(ln)
-        if cat_match:
-            # tenta captar dados na mesma linha
-            codigo = cat_match.group(1)
-            # Extrair preços finais (pega últimos 2 ocorrências como unit e total se presentes)
-            prices = re_price.findall(ln)
-            # extrai quantidades: procurar sequência de números inteiros (por ex '5 3 0 1 1 0' ) - heurística
-            qtds = re.findall(r"\b\d+\b", ln)
-            # descrição: parte do início até onde aparece a unidade/código; heurística: tudo antes do código encontrado
-            start_desc = ln[:cat_match.start()].strip()
-            description = start_desc
-
-            # tentativa melhor: se a linha começar com item número (ex: "13 BOROHIDRETO ..."), pega item número
-            item_num = ""
-            m_item = re.match(r"^(\d{1,3})\b", ln)
-            if m_item:
-                item_num = m_item.group(1)
-
-            # Para caso a linha seja muito curta (só código), agregamos a linha anterior como descrição
-            if len(description) < 5 and i > 0:
-                description = text_lines[i-1]
-
-            # tenta inferir unidade do pdf procurando tokens curtos como FR, SC, AM, UN, G, KG
-            unit_search = re.search(r"\b(FR|FRASCO|SC|SACO|AM|UN|UNIDADE|G|GR|KG|MG|L|ML|CX|CAIXA)\b", ln, flags=re.IGNORECASE)
-            unidade = unit_search.group(1) if unit_search else ""
-
-            # tenta pegar qtd e vunit/vtotal se possível
-            v_unit = 0.0
-            v_total = 0.0
-            qtd_val = 0.0
-
-            # heurística: últimos dois preços identificados -> vunit e vtotal (se existirem)
-            if len(prices) >= 2:
-                try:
-                    v_unit = clean_number(prices[-2])
-                    v_total = clean_number(prices[-1])
-                except:
-                    pass
-            elif len(prices) == 1:
-                v_unit = clean_number(prices[-1])
-
-            # heurística para qtd: se houver uma sequência de 6 inteiros (ex: 7 4 2 0 1 0) pode ser total e por locais
-            if len(qtds) >= 3:
-                # pegar o primeiro inteiro razoável >0
-                for q in qtds:
-                    if int(q) > 0 and len(q) <= 4:
-                        qtd_val = float(q)
-                        break
-
-            # finalmente registra linha
-            rows_struct.append({
+        if pattern_group.search(ln):
+            current_group = ln
+            continue
+        # se linha contém código, tenta extrair
+        m = pattern_cat.search(ln)
+        if m:
+            code = m.group(0)
+            # descrição heurística: parte até o código
+            desc = ln[:m.start()].strip()
+            # buscar preços na linha
+            prices = re.findall(r"\d{1,3}(?:[\.\,]\d{3})*[\.,]\d{2}", ln)
+            vunit = clean_number(prices[-2]) if len(prices) >= 2 else 0.0
+            vtotal = clean_number(prices[-1]) if len(prices) >= 1 else 0.0
+            # qtd heurística: primeiro inteiro >0 presente
+            q = 0
+            ints = re.findall(r"\b\d+\b", ln[:m.start()])
+            for it in ints[::-1]:
+                if int(it) > 0:
+                    q = float(it)
+                    break
+            rows.append({
                 "Grupo": current_group,
-                "Item": item_num,
-                "Código": codigo,
-                "Descrição": description,
-                "Unid PDF": unidade,
-                "Qtd": qtd_val,
-                "V. Unit": v_unit,
-                "V. Total PDF": v_total,
+                "Item": "",
+                "CATMAT": code,
+                "Descrição": desc,
+                "Unid": "",
+                "Qtd Total": q,
+                "Preço Unitário": vunit,
+                "Preço Total": vtotal,
                 "Linha Origem": ln
             })
-            i += 1
-            continue
+    if rows:
+        return pd.DataFrame(rows), None
 
-        # se não houver código, pode ser continuação da descrição (concatena com próxima linha)
-        # heurística: se a linha começa com letra e a próxima contém código, juntamos
-        if i+1 < len(text_lines) and re_catmat.search(text_lines[i+1]):
-            # juntar com a próxima e re-testar no próximo loop (não consumir agora)
-            i += 1
-            continue
-
-        i += 1
-
-    # Se extraiu algo via tabela (df_from_table) podemos tentar enriquecer rows_struct com códigos que aparecem no df
-    # Mas dado a variedade de layouts, retornamos rows_struct como DataFrame
-    if not rows_struct:
-        # fallback: se não identificou nada, tenta procurar ANY 5-7 dígitos no full text e criar linhas simples
-        fallback = []
-        for m in re.findall(r"\b\d{5,7}\b", full_text):
-            fallback.append({"Grupo":"Sem Grupo Identificado","Item":"","Código":m,"Descrição":"","Unid PDF":"","Qtd":0,"V. Unit":0,"V. Total PDF":0,"Linha Origem":""})
-        return pd.DataFrame(fallback), full_text
-
-    df = pd.DataFrame(rows_struct)
-    # Limpeza básica: remover duplicados por (Código, Descrição)
-    df = df.drop_duplicates(subset=["Código","Descrição"]).reset_index(drop=True)
-
-    return df, full_text
+    # último recurso: procura por qualquer 5-7 dígitos no texto e cria linhas
+    codes = list(set(re.findall(r"\b\d{5,7}\b", full_text)))
+    rows = [{"Grupo":"Sem Grupo Identificado","Item":"","CATMAT":c,"Descrição":"","Unid":"","Qtd Total":0,"Preço Unitário":0,"Preço Total":0,"Linha Origem":""} for c in codes]
+    return pd.DataFrame(rows), None
 
 # -------------------------
-# UI
+# Geração HTML por grupo (mantendo colunas originais)
 # -------------------------
-st.markdown("Envie o PDF do Termo de Referência (TR). O sistema tentará extrair grupos, itens e códigos CATMAT/CATSER, e fará consulta ao Compras.gov.br.")
-uploaded = st.file_uploader("Upload PDF", type=["pdf"])
+def generate_grouped_html(df, original_headers=None):
+    """
+    Gera HTML com uma tabela por grupo. original_headers: lista de strings que representam os headers a exibir (mantém ordem).
+    """
+    html_parts = []
+    groups = df['Grupo'].fillna("Sem Grupo Identificado").unique().tolist()
+    for g in groups:
+        sub = df[df['Grupo'].fillna("Sem Grupo Identificado")==g].copy()
+        html_parts.append(f'<h3>{g}</h3>')
+        if original_headers is None:
+            html = sub.to_html(index=False, escape=True)
+        else:
+            # reorganiza colunas para original headers intersectantes
+            cols = [c for c in original_headers if c in sub.columns]
+            if not cols:
+                cols = sub.columns.tolist()
+            html = sub[cols].to_html(index=False, escape=True)
+        html_parts.append(html)
+    return "\n".join(html_parts)
 
-if uploaded:
-    with st.spinner("Extraindo..."):
-        df_items, full_text = extract_structured_from_pdf(uploaded)
+# -------------------------
+# UI e fluxo principal
+# -------------------------
+st.markdown("Envie o PDF do Termo de Referência. O sistema tentará extrair a(s) tabela(s) preservando a ordem original das colunas sempre que possível. Depois você poderá consultar os códigos no catálogo do governo e baixar o Excel com duas abas (Itens + CATMAT).")
 
-    if df_items.empty:
-        st.error("Não foi possível extrair itens automaticamente. Verifique o PDF (scan/imagem) ou envie o arquivo original.")
+uploaded = st.file_uploader("Upload PDF do TR", type=["pdf"])
+if not uploaded:
+    st.info("Envie o PDF para iniciar a extração.")
+    st.stop()
+
+with st.spinner("Extraindo tabelas e texto do PDF... (pode demorar alguns segundos)"):
+    tabular_rows, full_text = extract_tables_and_lines(uploaded)
+
+with st.spinner("Reconstruindo DataFrame (heurística flexível)..."):
+    df_rebuilt, header_index = rebuild_structured_df(tabular_rows, full_text)
+
+if df_rebuilt is None or df_rebuilt.empty:
+    st.error("Não foi possível extrair tabelas ou códigos automaticamente. O PDF pode ser uma imagem (scan). Se for scan, use OCR primeiro.")
+    st.stop()
+
+# Tentativa de identificar uma coluna de grupo caso não exista
+if 'Grupo' not in df_rebuilt.columns:
+    # detecta padrões "GRUPO" na coluna de descrição ou linha origem
+    if 'Descrição' in df_rebuilt.columns:
+        # cria coluna Grupo por proximidade de pattern nas Linha Origem (se houver)
+        df_rebuilt['Grupo'] = df_rebuilt.get('Grupo', 'Sem Grupo Identificado')
     else:
-        st.success(f"{len(df_items)} itens/linhas extraídas (heurística).")
-        # Mostra tabela HTML formatada (usando to_html para manter formatação)
-        st.subheader("Tabela extraída (visualização)")
-        # monta colunas na ordem amigável
-        display_df = df_items[["Grupo","Item","Código","Descrição","Unid PDF","Qtd","V. Unit","V. Total PDF","Linha Origem"]]
-        # Exibe como dataframe normal (interativo)
-        st.dataframe(display_df, use_container_width=True, height=350)
+        df_rebuilt['Grupo'] = df_rebuilt.get('Grupo', 'Sem Grupo Identificado')
 
-        # Também fornece versão HTML tabulada (mais próxima do que você pediu)
-        st.markdown("### Versão HTML (para copy/paste)")
-        html_table = display_df.to_html(index=False, escape=False)
-        st.code(html_table, language='html')
+# Exibe resumo
+st.markdown("### ✅ Tabela Reconstruída (visualização)")
+st.info(f"Linhas extraídas: {len(df_rebuilt)} — Colunas detectadas: {', '.join(df_rebuilt.columns.astype(str).tolist())}")
 
-        # Botão para iniciar varredura/consulta GOV
-        if st.button("🔎 Consultar CATMAT/CATSER no Governo para todos os códigos"):
-            # preparar coluna de resultados
-            results = []
-            progress = st.progress(0)
-            for idx, r in df_items.iterrows():
-                progress.progress((idx+1)/len(df_items))
-                cod = r.get("Código")
-                # chamada de API
-                gov = consultar_item_governo(cod)
-                # comparação simples de unidade
-                unid_pdf = normalize_text(r.get("Unid PDF",""))
-                unid_gov = normalize_text(gov.get("unidade","-"))
-                # status técnico
-                if gov["status_api"].startswith("Ativo"):
-                    if unid_gov != "-" and unid_pdf and unid_pdf.upper() not in unid_gov.upper():
-                        status_tec = "Unid. Divergente"
-                    else:
-                        status_tec = "OK"
-                elif gov["status_api"] == "Não Encontrado":
-                    status_tec = "Não Encontrado"
-                else:
-                    status_tec = gov["status_api"]
+# Exibir DataFrame (opção A: só mostrar o DF organizado)
+st.dataframe(df_rebuilt, use_container_width=True, height=420)
 
-                results.append({
-                    "Grupo": r.get("Grupo"),
-                    "Item": r.get("Item"),
-                    "Código": cod,
-                    "Descrição PDF": r.get("Descrição"),
-                    "Unid PDF": r.get("Unid PDF"),
-                    "Qtd": r.get("Qtd"),
-                    "V. Unit": r.get("V. Unit"),
-                    "V. Total PDF": r.get("V. Total PDF"),
-                    "Status Técnico": status_tec,
-                    "Desc. Oficial (Gov)": gov.get("descricao",""),
-                    "Unid. Oficial (Gov)": gov.get("unidade","-"),
-                    "Link Gov": gov.get("link","")
-                })
+# Botão para gerar HTML por grupo (download)
+if st.button("📄 Gerar HTML tabulado por GRUPO (download)"):
+    original_headers = df_rebuilt.columns.tolist()
+    html_body = generate_grouped_html(df_rebuilt, original_headers=original_headers)
+    full_html = f"""<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"/><title>Tabela extraída - {datetime.now().date()}</title>
+<style>body{{font-family:Arial,Helvetica,sans-serif;padding:16px}}table{{border-collapse:collapse;width:100%;margin-bottom:18px}}th,td{{border:1px solid #bbb;padding:6px 8px;text-align:left}}th{{background:#f1f1f1}}</style>
+</head><body>
+<h2>Termo de Referência - Tabela extraída</h2>
+{html_body}
+</body></html>"""
+    b = full_html.encode('utf-8')
+    st.download_button("⬇️ Baixar HTML tabulado", data=b, file_name="tabela_extraida.html", mime="text/html")
 
-            df_res = pd.DataFrame(results)
-            st.subheader("Resultado da Consulta (tabela final)")
-            # Exibe com link ativo: cria coluna de HTML com anchor
-            df_display = df_res.copy()
-            df_display["Link Gov"] = df_display["Link Gov"].apply(lambda x: f'<a href="{x}" target="_blank">Abrir</a>' if x else "")
+# Botão para executar consulta CATMAT para todos os códigos detectados
+if st.button("🔎 Consultar todos os códigos no Compras.gov.br (CATMAT/CATSER)"):
+    # Identificar coluna de código: procura por col names que contenham catmat/catser/cod
+    code_col = None
+    for c in df_rebuilt.columns:
+        cl = str(c).lower()
+        if 'cat' in cl or 'cod' in cl or re.search(r'\b\d{5,7}\b', cl):
+            code_col = c
+            break
+    # fallback: buscar coluna que contem 5-7 dígitos em seus valores
+    if not code_col:
+        for c in df_rebuilt.columns:
+            sample = df_rebuilt[c].astype(str).head(20).tolist()
+            if any(re.search(r'\b\d{5,7}\b', s) for s in sample):
+                code_col = c
+                break
+    if not code_col:
+        st.error("Não encontrei uma coluna identificável de códigos CATMAT/CATSER. Verifique a tabela extraída.")
+        st.stop()
 
-            # mostra como dataframe interativo
-            st.dataframe(df_res.drop(columns=["Desc. Oficial (Gov)","Unid. Oficial (Gov)"]), use_container_width=True, height=420)
+    st.info(f"Coluna usada como código: '{code_col}'")
+    progress = st.progress(0)
+    results = []
+    uniques = df_rebuilt[code_col].astype(str).fillna("").unique().tolist()
+    uniques = [u for u in uniques if re.search(r'\d{5,7}', u)]
+    total = len(uniques)
+    for idx, code in enumerate(uniques):
+        progress.progress((idx+1)/max(1,total))
+        gov = consultar_item_governo(code)
+        results.append({
+            "Código": code,
+            "Status API": gov.get("status_api",""),
+            "Descrição Oficial": gov.get("descricao",""),
+            "Unidade Oficial": gov.get("unidade","-"),
+            "Link Gov": gov.get("link","")
+        })
+    df_catmat = pd.DataFrame(results)
+    st.subheader("Resultado da varredura CATMAT/CATSER (amostra)")
+    st.dataframe(df_catmat.head(200), use_container_width=True, height=300)
 
-            # mostra html completo (inclui descrição oficial)
-            st.markdown("### Tabela Final (HTML com descrições oficiais)")
-            html_final = df_display.to_html(index=False, escape=False)
-            st.code(html_final, language='html')
+    # Preparar Excel com duas abas: Itens (tabela completa) e CATMAT
+    with BytesIO() as buffer:
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            # itens: preserva todas as colunas detectadas
+            df_rebuilt.to_excel(writer, index=False, sheet_name="Itens")
+            # catmat results
+            df_catmat.to_excel(writer, index=False, sheet_name="CATMAT")
+            writer.save()
+        buffer.seek(0)
+        st.download_button("⬇️ Baixar Resultado (Excel com abas Itens + CATMAT)", data=buffer.getvalue(), file_name="auditoria_tr_resultados.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-            # Preparar excel em memória (corrige TypeError do streamlit)
-            with BytesIO() as buffer:
-                with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                    df_res.to_excel(writer, index=False, sheet_name="auditoria")
-                    writer.save()
-                buffer.seek(0)
-                st.download_button(
-                    label="⬇️ Baixar relatório (Excel)",
-                    data=buffer.getvalue(),
-                    file_name="auditoria_catmat.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-
-            st.success("Consulta finalizada. Revise as linhas com Status Técnico diferente de 'OK'.")
-
+    st.success("Consulta finalizada. Baixe o arquivo Excel para ver todas as colunas e resultados CATMAT.")
