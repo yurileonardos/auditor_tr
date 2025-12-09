@@ -1,7 +1,8 @@
-streamlit==1.26.0
-pandas==2.2.2
-pdfplumber==0.8.1
-requests==2.31.0
-openpyxl==3.1.2
-beautifulsoup4==4.12.2
-lxml==4.9.3
+streamlit
+pandas
+pdfplumber
+requests
+openpyxl
+pdfminer-six
+pypdfium2
+beautifulsoup4
