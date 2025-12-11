@@ -4,4 +4,6 @@ pdfplumber
 requests
 pypdfium2
 pillow
-openai  # opcional
+openpyxl
+lxml
+beautifulsoup4
