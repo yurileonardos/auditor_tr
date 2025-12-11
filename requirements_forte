@@ -1,9 +1,0 @@
-pip==24.0
-wheel
-setuptools
-streamlit
-pandas
-pdfplumber
-requests
-beautifulsoup4
-openpyxl
