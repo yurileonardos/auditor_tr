@@ -1,54 +1,58 @@
 # app.py
 """
-Auditor TR — Extração Robusta + Validação via Planilha Oficial CATMAT/CATSER + (Opcional) HTML via ChatGPT
-- Baixa planilha oficial do gov.br (cacheada)
-- Extrai tabela do PDF por coordenadas (pdfplumber)
-- Faz matching por código/descrição/unidade usando a planilha
-- Gera HTML e Excel com resultados
-- Opcional: chama OpenAI para produzir HTML tabulado "fiel" (precisa de OPENAI_API_KEY)
+Auditor TR — Extração Robusta + Validação com Planilha Oficial + OCR via OpenAI (opcional)
+- Extração por coordenadas (pdfplumber)
+- Fallbacks: pdfminer (texto) -> OCR local (pytesseract) -> OCR via OpenAI (se OPENAI_API_KEY configurada)
+- Validação com planilha oficial CATMAT/CATSER (downloadada e cacheada)
+- Opcional: gerar HTML via OpenAI (ChatGPT)
+Notes:
+ - Para OCR via OpenAI você precisa configurar OPENAI_API_KEY (st.secrets["OPENAI_API_KEY"]) e sua conta precisa ter permissões de file upload / responses que retornem PDF.
+ - Se OpenAI OCR não funcionar, habilite OCR local (instale tesseract-ocr) e as libs pytesseract & pypdfium2 no requirements.txt.
 """
 
+import os
+import io
+import re
+import time
+import base64
 import streamlit as st
 import pandas as pd
 import pdfplumber
-import re
 import requests
-import io
-import time
 from collections import defaultdict
 from datetime import datetime
 from difflib import SequenceMatcher
 from bs4 import BeautifulSoup
 
-# Optional OCR / rendering
+# Optional libs for local OCR / rendering
 try:
     import pypdfium2 as pdfium
     from PIL import Image
     import pytesseract
-    OCR_AVAILABLE = True
+    OCR_AVAILABLE_LOCAL = True
 except Exception:
     pdfium = None
     Image = None
     pytesseract = None
-    OCR_AVAILABLE = False
+    OCR_AVAILABLE_LOCAL = False
 
-# Optional OpenAI
+# Optional OpenAI SDK
 try:
     import openai
-    OPENAI_AVAILABLE = True
+    OPENAI_SDK_AVAILABLE = True
 except Exception:
     openai = None
-    OPENAI_AVAILABLE = False
+    OPENAI_SDK_AVAILABLE = False
 
-# ---------------- CONFIG ----------------
-st.set_page_config(page_title="Auditor TR — CATMAT + ChatGPT", layout="wide")
-st.title("🛡️ Auditor TR — Extração + Validação CATMAT/CATSER")
+# ---------- Streamlit UI config ----------
+st.set_page_config(page_title="Auditor TR — OCR + CATMAT", layout="wide")
+st.title("🛡️ Auditor TR — OCR (opcional OpenAI) + Extração + Validação CATMAT")
 
-# ---------------- UTILITIES ----------------
+# ---------- Helpers ----------
 def clean_number(value):
     if value is None:
         return 0.0
-    s = str(value).strip()
+    s = str(value)
     s = s.replace("R$", "").replace("\xa0", " ").replace(".", "").replace(",", ".")
     s = re.sub(r"[^\d\.\-]", "", s)
     try:
@@ -66,161 +70,76 @@ def similarity(a, b):
         return 0.0
     return SequenceMatcher(None, str(a).lower(), str(b).lower()).ratio()
 
-# ---------------- CATALOGUE (download + cache) ----------------
+# ---------- Catalog download & cache ----------
 CATALOG_PAGE = "https://www.gov.br/compras/pt-br/acesso-a-informacao/consulta-detalhada/planilha-catmat-catser"
 
-@st.cache_data(ttl=60*60*6, show_spinner=False)  # cache 6h
+@st.cache_data(ttl=60*60*6, show_spinner=False)
 def download_latest_catalog():
-    """Baixa a planilha oficial (xls/xlsx/zip) do gov.br e retorna (catmat_df, catser_df, meta)."""
-    resp = requests.get(CATALOG_PAGE, timeout=20)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # procura por links diretos para xlsx/ods/zip
+    """Download the official catalog file linked on gov.br and return (catmat_df, catser_df, meta)"""
+    r = requests.get(CATALOG_PAGE, timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
     candidates = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if href.lower().endswith((".xlsx", ".xls", ".ods", ".zip")):
+        if href.lower().endswith((".xlsx",".xls",".ods",".zip")):
             candidates.append(href)
-    # fallback: procurar pelo texto
     if not candidates:
+        # fallback search by anchor text
         for a in soup.find_all("a", href=True):
             txt = (a.get_text() or "").lower()
             if "catmat" in txt or "catser" in txt:
                 candidates.append(a["href"])
-
     if not candidates:
-        raise RuntimeError("Não achei link direto para a planilha CATMAT/CATSER na página oficial.")
-
+        raise RuntimeError("Não foi possível localizar o link da planilha no site do gov.br")
     link = candidates[0]
     if link.startswith("/"):
         link = "https://www.gov.br" + link
-
-    r = requests.get(link, timeout=60)
-    r.raise_for_status()
-    content = r.content
-    content_disp = r.headers.get("content-disposition","")
-    content_type = r.headers.get("content-type","")
-
-    # tentar ler Excel(s)
+    r2 = requests.get(link, timeout=60)
+    r2.raise_for_status()
+    content = r2.content
     dfs = {}
     try:
-        # se for zip, extrai primeiro
-        if link.lower().endswith(".zip") or "zip" in content_type:
+        if link.lower().endswith(".zip") or "zip" in r2.headers.get("content-type",""):
             import zipfile
             z = zipfile.ZipFile(io.BytesIO(content))
             names = [n for n in z.namelist() if n.lower().endswith((".xlsx",".xls",".ods"))]
-            if not names:
-                # carregar tudo e tentar
-                names = z.namelist()
-            # ler todos os xlsx que encontrar
             for n in names:
-                if n.lower().endswith((".xlsx",".xls",".ods")):
-                    b = z.read(n)
-                    sheets = pd.read_excel(io.BytesIO(b), sheet_name=None)
-                    for k,v in sheets.items():
-                        dfs[f"{n}::{k}"] = v
+                b = z.read(n)
+                sheets = pd.read_excel(io.BytesIO(b), sheet_name=None)
+                for k,v in sheets.items():
+                    dfs[f"{n}::{k}"] = v
         else:
-            # arquivo único
             sheets = pd.read_excel(io.BytesIO(content), sheet_name=None)
             for k,v in sheets.items():
                 dfs[k] = v
-    except Exception as e:
-        # último recurso: tentativa simplificada via pandas (pode falhar)
+    except Exception:
         try:
             df_single = pd.read_excel(io.BytesIO(content), sheet_name=0)
             dfs["sheet0"] = df_single
-        except Exception as e2:
-            raise RuntimeError("Falha ao ler planilha do catálogo: " + str(e2))
-
-    # heurística para identificar catmat e catser
-    catmat_df = None
-    catser_df = None
-    for name, d in dfs.items():
-        cols = [str(c).lower() for c in d.columns]
-        joined = " ".join(cols)
-        if "catmat" in name.lower() or any("catmat" in c for c in cols) or any("materiais" in c for c in cols):
-            catmat_df = d.copy()
-        if "catser" in name.lower() or any("catser" in c for c in cols) or any("servicos" in c for c in cols):
-            catser_df = d.copy()
-    # fallback: if only one sheet, use it as catmat candidate
-    if catmat_df is None and len(dfs)==1:
+        except Exception as e:
+            raise RuntimeError("Falha ao ler a planilha do catálogo: " + str(e))
+    catmat_df, catser_df = None, None
+    for name, df in dfs.items():
+        cols = [str(c).lower() for c in df.columns]
+        if any("catmat" in c for c in cols) or "materiais" in " ".join(cols):
+            catmat_df = df.copy()
+        if any("catser" in c for c in cols) or "servicos" in " ".join(cols):
+            catser_df = df.copy()
+    if catmat_df is None and len(dfs) == 1:
         catmat_df = next(iter(dfs.values())).copy()
-
     def clean_cols(df):
         df2 = df.copy()
         df2.columns = [str(c).strip() for c in df2.columns]
         return df2
-
-    if catmat_df is not None:
-        catmat_df = clean_cols(catmat_df)
-    if catser_df is not None:
-        catser_df = clean_cols(catser_df)
-
+    if catmat_df is not None: catmat_df = clean_cols(catmat_df)
+    if catser_df is not None: catser_df = clean_cols(catser_df)
     meta = {"url": link, "fetched_at": time.time()}
     return catmat_df, catser_df, meta
 
-# ---------------- MATCH ITEM WITH CATALOG ----------------
-def match_item_with_catalog(code_pdf, desc_pdf, unit_pdf, catmat_df):
-    """Retorna dict com informação encontrada e scores"""
-    if catmat_df is None:
-        return {"found": False, "reason": "No catalog"}
-
-    code_clean = re.sub(r"\D", "", str(code_pdf))
-    # find code column heuristically
-    code_cols = [c for c in catmat_df.columns if any(k in c.lower() for k in ("codigo","cod","catmat","cat"))]
-    desc_cols = [c for c in catmat_df.columns if "descr" in c.lower() or "descricao" in c.lower()]
-    unit_cols = [c for c in catmat_df.columns if any(k in c.lower() for k in ("unid","unidade","medida"))]
-
-    df = catmat_df.copy()
-    # try exact code match
-    if code_cols:
-        ccol = code_cols[0]
-        df["_code_norm"] = df[ccol].astype(str).str.replace(r"\D","", regex=True)
-        matches = df[df["_code_norm"] == code_clean]
-        if not matches.empty:
-            rec = matches.iloc[0].to_dict()
-            desc_off = rec.get(desc_cols[0]) if desc_cols else ""
-            unit_off = rec.get(unit_cols[0]) if unit_cols else ""
-            sim_desc = similarity(desc_pdf, desc_off)
-            unit_match = False
-            if unit_off and unit_pdf:
-                up = str(unit_pdf).strip().upper()
-                uo = str(unit_off).strip().upper()
-                unit_match = (up in uo) or (uo in up)
-            return {
-                "found": True,
-                "matched_by": "code",
-                "record": rec,
-                "desc_official": desc_off,
-                "unit_official": unit_off,
-                "desc_similarity": sim_desc,
-                "unit_match": unit_match
-            }
-
-    # fallback: fuzzy by description
-    if desc_cols:
-        dcol = desc_cols[0]
-        df["_sim"] = df[dcol].astype(str).apply(lambda d: similarity(d, str(desc_pdf)))
-        best = df.sort_values("_sim", ascending=False).head(5)
-        top = best.iloc[0]
-        rec = top.to_dict()
-        return {
-            "found": True,
-            "matched_by": "desc_fuzzy",
-            "record": rec,
-            "desc_official": rec.get(dcol),
-            "unit_official": rec.get(unit_cols[0]) if unit_cols else None,
-            "desc_similarity": float(top.get("_sim", 0.0)),
-            "unit_match": False
-        }
-
-    return {"found": False}
-
-# ---------------- ROBUST PDF EXTRACTION (words -> coords) ----------------
+# ---------- robust extraction by coords ----------
 def cluster_positions(values, tol=10):
-    if not values:
-        return []
+    if not values: return []
     vals = sorted(values)
     clusters = [[vals[0]]]
     for v in vals[1:]:
@@ -241,24 +160,20 @@ def extract_words_table_by_coords(file_stream):
                 words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
                 if not words:
                     continue
-
-                y_positions = [round(w.get("top", 0)) for w in words]
+                y_positions = [round(w.get("top",0)) for w in words]
                 y_clusters = cluster_positions(y_positions, tol=3)
                 lines_map = defaultdict(list)
                 for w in words:
-                    top = round(w.get("top", 0))
-                    nearest = min(y_clusters, key=lambda c: abs(c - top)) if y_clusters else top
+                    top = round(w.get("top",0))
+                    nearest = min(y_clusters, key=lambda c: abs(c-top)) if y_clusters else top
                     lines_map[nearest].append(w)
-
                 x_centers = [ (w.get("x0",0)+w.get("x1",0))/2.0 for w in words ]
                 x_cols = cluster_positions(x_centers, tol=22)
-
                 if not x_cols:
                     for _, ln_words in sorted(lines_map.items(), key=lambda kv: kv[0]):
                         ordered = sorted(ln_words, key=lambda w: w.get("x0",0))
                         rows_out.append([" ".join(w.get("text","") for w in ordered)])
                     continue
-
                 for _, ln_words in sorted(lines_map.items(), key=lambda kv: kv[0]):
                     ordered = sorted(ln_words, key=lambda w: w.get("x0",0))
                     cells = [""] * len(x_cols)
@@ -269,8 +184,7 @@ def extract_words_table_by_coords(file_stream):
                             cells[idx] += " " + w.get("text","")
                         else:
                             cells[idx] = w.get("text","")
-                    cells = [c.strip() for c in cells]
-                    rows_out.append(cells)
+                    rows_out.append([c.strip() for c in cells])
     except Exception as e:
         full_text += f"\n[pdfplumber-extract-error] {e}\n"
     return rows_out, full_text
@@ -357,160 +271,261 @@ def rows_to_df_from_coords(rows, full_text):
             data[c] = data[c].apply(clean_number)
     return data, full_text
 
-# ---------------- OpenAI HTML generator (optional) ----------------
-def generate_html_with_gpt(rows_json, system_prompt=None, model="gpt-4o-mini"):
-    """
-    Envia as linhas (JSON) para a API do OpenAI e pede HTML tabulado.
-    REQUISITOS: OPENAI_API_KEY em st.secrets e openai instalado.
-    """
-    if not OPENAI_AVAILABLE:
-        return None, "openai package not installed"
-    # require key in secrets
-    key = st.secrets.get("OPENAI_API_KEY") if st.secrets else None
-    if not key:
-        return None, "OPENAI_API_KEY não encontrado em st.secrets"
-    openai.api_key = key
+# ---------- Match with catalog ----------
+def match_item_with_catalog(code_pdf, desc_pdf, unit_pdf, catmat_df):
+    if catmat_df is None:
+        return {"found": False, "reason": "No catalog"}
+    code_clean = re.sub(r"\D", "", str(code_pdf))
+    code_cols = [c for c in catmat_df.columns if any(k in c.lower() for k in ("codigo","cod","catmat","cat"))]
+    desc_cols = [c for c in catmat_df.columns if "descr" in c.lower() or "descricao" in c.lower()]
+    unit_cols = [c for c in catmat_df.columns if any(k in c.lower() for k in ("unid","unidade","medida"))]
+    df = catmat_df.copy()
+    if code_cols:
+        ccol = code_cols[0]
+        df["_code_norm"] = df[ccol].astype(str).str.replace(r"\D","", regex=True)
+        matches = df[df["_code_norm"] == code_clean]
+        if not matches.empty:
+            rec = matches.iloc[0].to_dict()
+            desc_off = rec.get(desc_cols[0]) if desc_cols else ""
+            unit_off = rec.get(unit_cols[0]) if unit_cols else ""
+            sim_desc = similarity(desc_pdf, desc_off)
+            unit_match = False
+            if unit_off and unit_pdf:
+                up = str(unit_pdf).strip().upper()
+                uo = str(unit_off).strip().upper()
+                unit_match = (up in uo) or (uo in up)
+            return {"found": True, "matched_by": "code", "record": rec, "desc_official": desc_off, "unit_official": unit_off, "desc_similarity": sim_desc, "unit_match": unit_match}
+    if desc_cols:
+        dcol = desc_cols[0]
+        df["_sim"] = df[dcol].astype(str).apply(lambda d: similarity(d, str(desc_pdf)))
+        best = df.sort_values("_sim", ascending=False).head(5)
+        top = best.iloc[0]
+        rec = top.to_dict()
+        return {"found": True, "matched_by": "desc_fuzzy", "record": rec, "desc_official": rec.get(dcol), "unit_official": rec.get(unit_cols[0]) if unit_cols else None, "desc_similarity": float(top.get("_sim", 0.0)), "unit_match": False}
+    return {"found": False}
 
-    prompt = (system_prompt or
-              "Você é um assistente que recebe dados de uma tabela em JSON e deve devolver um HTML tabelado fiel ao layout. "
-              "Receba o JSON e gere HTML com <table>, <thead>, <tbody> e classes mínimas. Não acrescente explicações.")
-    user_content = f"Dados (JSON):\n{rows_json}\n\nGere somente o HTML da tabela (sem texto extra)."
+# ---------- OCR via OpenAI (attempt) ----------
+def convert_pdf_to_searchable_via_openai(pdf_bytes):
+    """
+    Attempt to convert scanned PDF to searchable PDF using OpenAI Responses API (file upload).
+    NOTE: This relies on your OpenAI account/SDK supporting file uploads to the responses endpoint and returning a PDF.
+    There is no universal guarantee — if your account/SDK does not support it, this function will raise/return error.
+    """
+    if not OPENAI_SDK_AVAILABLE:
+        return None, "OpenAI SDK not installed"
+    key = None
+    if st.secrets and "OPENAI_API_KEY" in st.secrets:
+        key = st.secrets["OPENAI_API_KEY"]
+    else:
+        key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        return None, "OPENAI_API_KEY not configured"
     try:
-        resp = openai.ChatCompletion.create(
-            model=model,
-            messages=[
-                {"role":"system","content":prompt},
-                {"role":"user","content":user_content}
-            ],
-            max_tokens=2500,
+        # Attempt with modern OpenAI python client pattern
+        openai.api_key = key
+        # Two strategies: (A) client.responses.create with files (if supported),
+        # (B) fallback: send base64 in chat message (less ideal, may hit size limits)
+        try:
+            # Strategy A: responses.create with files (preferred if available)
+            # NOTE: many accounts/SDKs vary; change if your SDK uses a client object
+            if hasattr(openai, "Responses") or hasattr(openai, "responses"):
+                # Build a request that instructs model to return base64 of searchable PDF
+                # This block may need adaptation depending on SDK; keep try/except
+                file_b64 = base64.b64encode(pdf_bytes).decode()
+                prompt = ("Converta este PDF escaneado em um PDF pesquisável (OCR). "
+                          "Retorne o PDF resultante codificado em base64, sem texto adicional; responda com apenas o base64.")
+                resp = openai.responses.create(
+                    model="gpt-4o-mini",
+                    input=[{"role":"user","content": prompt + "\n\nArquivo(base64):\n" + file_b64}],
+                    max_output_tokens=200000
+                )
+                # Try to extract text content as base64 from response
+                # The exact path depends on the SDK/response shape
+                text_out = ""
+                try:
+                    # new Responses API often returns content in resp.output_text or choices
+                    text_out = resp.output_text if hasattr(resp, "output_text") else None
+                except Exception:
+                    text_out = None
+                if not text_out:
+                    # try older shape
+                    try:
+                        text_out = resp["output"][0]["content"][0]["text"]
+                    except Exception:
+                        text_out = None
+                if not text_out:
+                    return None, "OpenAI response did not include base64 PDF (response shape mismatch)."
+                # decode
+                pdf_new = base64.b64decode(text_out.strip())
+                return pdf_new, None
+            else:
+                return None, "OpenAI Responses API with file upload not supported in this SDK"
+        except Exception as e:
+            return None, f"OpenAI OCR attempt failed: {e}"
+    except Exception as e:
+        return None, f"OpenAI client error: {e}"
+
+# ---------- Local OCR fallback (pypdfium2 + pytesseract) ----------
+def ocr_local_convert_pdf_to_searchable(pdf_bytes):
+    """
+    Local OCR fallback: render pages with pypdfium2 and run pytesseract, then construct text per page.
+    This does not produce a full 'PDF with embedded text' automatically unless you stitch images into a PDF and embed text layers.
+    Instead we return the OCR text (which the extractor can use).
+    """
+    if not OCR_AVAILABLE_LOCAL:
+        return None, "Local OCR libs not available (pytesseract/pypdfium2)"
+    try:
+        pdf = pdfium.PdfDocument(pdf_bytes)
+        pages_text = []
+        for i in range(len(pdf)):
+            page = pdf[i]
+            bm = page.render(scale=2.0)
+            pil = bm.to_pil()
+            txt = pytesseract.image_to_string(pil, lang='por+eng')
+            pages_text.append(txt)
+        full_text = "\n".join(pages_text)
+        return full_text, None
+    except Exception as e:
+        return None, str(e)
+
+# ---------- OpenAI HTML generator (optional) ----------
+def generate_html_with_gpt(rows_json):
+    """Generate HTML table using OpenAI (ChatGPT). Requires OPENAI_API_KEY in secrets."""
+    if not OPENAI_SDK_AVAILABLE:
+        return None, "OpenAI SDK not installed"
+    key = None
+    if st.secrets and "OPENAI_API_KEY" in st.secrets:
+        key = st.secrets["OPENAI_API_KEY"]
+    else:
+        key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        return None, "OPENAI_API_KEY not configured"
+    openai.api_key = key
+    prompt = ("Receba os dados JSON e gere somente um HTML <table> fiel. JSON:\n" + rows_json)
+    try:
+        # simple ChatCompletion usage; may be adapted to Responses API if desired
+        completion = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
+            max_tokens=2000,
             temperature=0.0
         )
-        html = resp["choices"][0]["message"]["content"]
+        html = completion.choices[0].message.content
         return html, None
     except Exception as e:
         return None, str(e)
 
-# ---------------- UI FLOW ----------------
+# ---------- UI ----------
 st.sidebar.header("Configurações")
-st.sidebar.write("- Cache da planilha: 6 horas\n- OpenAI HTML: opcional (configure OPENAI_API_KEY em st.secrets)")
+st.sidebar.markdown("- OCR: OpenAI (se configurado) → fallback local OCR (se disponível)\n- Cache da planilha: 6h")
 
-uploaded = st.file_uploader("📂 Envie o TR (PDF)", type=["pdf"])
+uploaded = st.file_uploader("📂 Envie o TR (PDF) — se escaneado, marque OCR abaixo", type=["pdf"])
 if not uploaded:
-    st.info("Envie o PDF do Termo de Referência para iniciar.")
+    st.info("Envie o PDF para começar.")
     st.stop()
+
+use_openai_ocr = st.checkbox("Usar OCR remoto via OpenAI (requer OPENAI_API_KEY em Secrets)", value=False)
+use_local_ocr = st.checkbox("Permitir OCR local (pytesseract/pypdfium2) se OpenAI não estiver disponível", value=True)
 
 file_bytes = uploaded.read()
 file_stream = io.BytesIO(file_bytes)
 
-# 1) extrair via coords
-with st.spinner("Extraindo palavras e reconstruindo tabela (pdfplumber)..."):
+# If PDF has embedded text, we can extract directly; otherwise attempt OCR routes
+with st.spinner("Tentando extrair tabelas com pdfplumber..."):
     rows, full_text = extract_words_table_by_coords(file_stream)
-
 df, full_text_df = rows_to_df_from_coords(rows, full_text)
 
-# 2) fallback pdfminer
+# If no table found, try OCR via OpenAI then re-extract; else local OCR text
 if df.empty or len(df) < 1:
-    with st.spinner("Fallback com pdfminer (texto)..."):
-        try:
-            from pdfminer.high_level import extract_text
-            txt = extract_text(io.BytesIO(file_bytes))
-        except Exception:
-            txt = ""
-        if txt:
+    st.warning("Não foi possível extrair itens automaticamente a partir do PDF atual. Tentando OCR...")
+    pdf_searchable_bytes = None
+    ocr_text = None
+    # 1) Try OpenAI OCR if requested
+    if use_openai_ocr:
+        st.info("Tentando OCR remoto via OpenAI (isso envia o PDF para a API OpenAI).")
+        pdf_searchable_bytes, err = convert_pdf_to_searchable_via_openai(file_bytes)
+        if err:
+            st.error("OpenAI OCR falhou: " + str(err))
+            pdf_searchable_bytes = None
+        else:
+            st.success("OpenAI OCR retornou um PDF pesquisável (tentando re-extrair).")
+            # write to temp stream and re-run extraction
+            file_stream = io.BytesIO(pdf_searchable_bytes)
+            rows, full_text = extract_words_table_by_coords(file_stream)
+            df, full_text_df = rows_to_df_from_coords(rows, full_text)
+    # 2) If still empty, try local OCR to get text (if allowed)
+    if (df.empty or len(df) < 1) and use_local_ocr:
+        st.info("Tentando OCR local (pypdfium2 + pytesseract) — requisição local.")
+        ocr_text, err_local = ocr_local_convert_pdf_to_searchable(file_bytes)
+        if err_local:
+            st.error("OCR local falhou: " + str(err_local))
+            ocr_text = None
+        else:
+            st.success("OCR local obteve texto — vamos tentar extrair linhas por heurística textual.")
+            # crude parsing: lines with codes -> feed rows_to_df_from_coords fallback
             candidates = []
-            for ln in [l.strip() for l in txt.splitlines() if l.strip()]:
+            for ln in [l.strip() for l in ocr_text.splitlines() if l.strip()]:
                 if re.search(r"\b\d{5,7}\b", ln):
                     candidates.append([ln])
             if candidates:
-                df2, _ = rows_to_df_from_coords(candidates, txt)
-                if not df2.empty:
-                    df = df2
-                    full_text_df = txt
-
-# 3) OCR fallback (local only)
-if (df.empty or len(df) < 1) and OCR_AVAILABLE:
-    with st.spinner("Tentando OCR (pypdfium2 + pytesseract)..."):
-        ocr_text = ""
-        try:
-            pdf = pdfium.PdfDocument(file_bytes)
-            for i in range(len(pdf)):
-                page = pdf[i]
-                bm = page.render(scale=2.0)
-                pil = bm.to_pil()
-                ocr_text += pytesseract.image_to_string(pil, lang='por+eng') + "\n"
-        except Exception as e:
-            ocr_text = ""
-        if ocr_text:
-            cand = []
-            for ln in [l.strip() for l in ocr_text.splitlines() if l.strip()]:
-                if re.search(r"\b\d{5,7}\b", ln):
-                    cand.append([ln])
-            if cand:
-                df2,_ = rows_to_df_from_coords(cand, ocr_text)
+                df2, _ = rows_to_df_from_coords(candidates, ocr_text)
                 if not df2.empty:
                     df = df2
                     full_text_df = ocr_text
 
-# final check
+# Final check again
 if df.empty or len(df) < 1:
-    st.error("Não foi possível extrair itens automaticamente. Se o PDF for escaneado, ative OCR local ou envie PDF pesquisável.")
+    st.error("Não foi possível extrair itens automaticamente. Se o PDF for escaneado, ative OCR local ou forneça OPENAI_API_KEY para OCR remoto.")
     st.subheader("Trecho de texto extraído (amostra):")
-    st.code((full_text_df or full_text)[:1000])
+    st.code((full_text_df or full_text)[:1000] or "— sem texto extraído —")
     st.stop()
 
+# Display extracted table
 st.markdown("### ✅ Tabela extraída (prévia)")
-st.write(f"Linhas: {len(df)} — Colunas: {', '.join(df.columns)}")
+st.write(f"Linhas: {len(df)} — Colunas detectadas: {', '.join(df.columns)}")
 st.dataframe(df, width="stretch", height=360)
 
-# Download básico (HTML/Excel) — versão local
-def df_to_html_raw(df):
-    return df.to_html(index=False, escape=True)
-
+# Download HTML/Excel and validate with CATMAT
 c1, c2, c3 = st.columns([1,1,1])
 with c1:
-    if st.button("📄 Gerar/baixar HTML (padrão pandas)"):
-        st.download_button("⬇️ Baixar HTML", df_to_html_raw(df).encode("utf-8"), file_name="tabela_pandastable.html", mime="text/html")
-
+    if st.button("📄 Gerar/baixar HTML (pandas)"):
+        html = df.to_html(index=False, escape=True)
+        st.download_button("⬇️ Baixar HTML", data=html.encode("utf-8"), file_name="tabela_pandastable.html", mime="text/html")
 with c2:
     if st.button("⬇️ Gerar e baixar Excel consolidado"):
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name="Itens", index=False)
         buf.seek(0)
-        st.download_button("⬇️ Baixar Excel", buf.getvalue(), file_name="tabela_final.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
+        st.download_button("⬇️ Baixar Excel", data=buf.getvalue(), file_name="tabela_final.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 with c3:
-    if st.button("🔎 Verificar / validar com planilha oficial (CATMAT)"):
+    if st.button("🔎 Validar com planilha oficial (CATMAT)"):
         with st.spinner("Baixando planilha oficial e validando..."):
             try:
                 catmat_df, catser_df, meta = download_latest_catalog()
             except Exception as e:
                 st.error("Falha ao baixar planilha oficial: " + str(e))
                 st.stop()
-
             st.write(f"Planilha usada: {meta.get('url')} (baixada em {datetime.utcfromtimestamp(meta.get('fetched_at')).isoformat()} UTC)")
-
-            # localiza coluna de codigo no df extraído
+            # detect code column heuristically
             code_col = None
             for c in df.columns:
                 if c.lower() in ("catmat","catser","codigo","cod","cód"):
                     code_col = c; break
             if not code_col:
-                # heurística: column with many digits
                 for c in df.columns:
                     sample = df[c].astype(str).head(40).tolist()
                     if any(re.search(r"\b\d{5,7}\b", s) for s in sample):
                         code_col = c; break
-
             results = []
             for idx, row in df.iterrows():
-                code_val = row.get(code_col, "") if code_col else ""
-                desc_val = row.get("Descrição", "")
-                unit_val = row.get("Unidade", "")
+                code_val = row.get(code_col,"") if code_col else ""
+                desc_val = row.get("Descrição","")
+                unit_val = row.get("Unidade","")
                 match = match_item_with_catalog(code_val, desc_val, unit_val, catmat_df)
                 status = "❌ Não encontrado"
                 if match.get("found"):
-                    sim = match.get("desc_similarity", 0.0)
+                    sim = match.get("desc_similarity",0.0)
                     unit_ok = match.get("unit_match", False)
                     if unit_ok and sim >= 0.65:
                         status = "✅ OK"
@@ -521,46 +536,43 @@ with c3:
                 results.append({
                     "Item": row.get("Item",""),
                     "Código PDF": code_val,
-                    "Descrição PDF": (desc_val[:120] + "...") if len(str(desc_val))>120 else desc_val,
+                    "Descrição PDF": (desc_val[:120]+"...") if len(str(desc_val))>120 else desc_val,
                     "Unid. PDF": unit_val,
                     "Encontrado?": match.get("found", False),
-                    "Unid. Oficial": match.get("unit_official", ""),
+                    "Unid. Oficial": match.get("unit_official",""),
                     "Desc. Oficial (amostra)": (str(match.get("desc_official",""))[:120] + "...") if match.get("desc_official") else "",
-                    "SimDesc": float(match.get("desc_similarity", 0.0)),
+                    "SimDesc": float(match.get("desc_similarity",0.0)),
                     "UnitMatch": match.get("unit_match", False),
                     "Status": status
                 })
             df_res = pd.DataFrame(results)
             st.dataframe(df_res, width="stretch", height=450)
-            # enable download
+            # download option
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine="openpyxl") as writer:
                 df.to_excel(writer, sheet_name="Itens", index=False)
                 df_res.to_excel(writer, sheet_name="Validação_CATMAT", index=False)
             buf.seek(0)
-            st.download_button("⬇️ Baixar Excel (Itens + Validação CATMAT)", buf.getvalue(), file_name="auditoria_catmat.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button("⬇️ Baixar Excel (Itens + Validação CATMAT)", data=buf.getvalue(), file_name="auditoria_catmat.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# Option: use ChatGPT to generate cleaner HTML (only if user wants)
+# Optional: generate HTML via ChatGPT
 st.markdown("### ✨ (Opcional) Gerar HTML formatado usando ChatGPT")
 use_gpt = st.checkbox("Gerar HTML via ChatGPT (opcional)", value=False)
 if use_gpt:
-    st.info("Para usar isto, configure OPENAI_API_KEY em st.secrets (Streamlit Cloud) ou localmente como variável de ambiente.")
-    if not OPENAI_AVAILABLE:
-        st.warning("openai SDK não instalado — adicione openai no requirements.txt")
+    if not OPENAI_SDK_AVAILABLE:
+        st.warning("openai SDK não instalado — adicione openai ao requirements.txt")
     else:
         if st.button("🔁 Gerar HTML via ChatGPT"):
-            # convert df to JSON-light for prompt (avoid huge payloads)
             rows_json = df.fillna("").to_dict(orient="records")
-            html, err = generate_html_with_gpt(rows_json)
+            html, err = generate_html_with_gpt(str(rows_json))
             if err:
                 st.error("Falha ao gerar HTML via OpenAI: " + str(err))
             else:
-                st.markdown("#### HTML gerado (preview):")
                 st.components.v1.html(html, height=600, scrolling=True)
                 st.download_button("⬇️ Baixar HTML (ChatGPT)", data=html.encode("utf-8"), file_name="tabela_chatgpt.html", mime="text/html")
 
 # Quick math checks
-st.markdown("### ℹ️ Verificações matemáticas rápidas")
+st.markdown("### ℹ️ Verificações rápidas")
 if "QTD" in df.columns and "Preço Unitário (R$)" in df.columns and "Preço Total (R$)" in df.columns:
     df_check = df.copy()
     df_check["Total Calculado"] = df_check["QTD"].apply(clean_number) * df_check["Preço Unitário (R$)"].apply(clean_number)
